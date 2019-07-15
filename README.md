@@ -390,9 +390,9 @@ SELECT...FROM...WHERE
 ### 行转列: explode(col) + lateral view
 
 ```sql
-select t1.col1, t2.col2
+select t1.col1, subview.col2
 from table t1
-lateral view explode(col) t2 as col2
+lateral view explode(col) subview as col2
 where ...
 
 ```
@@ -701,3 +701,251 @@ SELECT url, ip, user_id FROM s WHERE dt='20190101'
 
 * 最终输出结果压缩:hive.exec.compress.output=true,默认为false
 	* 如果设置为true后,需要为其制定一个编/解码器:mapred.output.compression.codec=org.apache.hadoop.io.compress.GzipCodec
+
+* [hive优化十个原则](https://www.cnblogs.com/sandbank/p/6408762.html)
+* [关于数据倾斜问题的解决](https://segmentfault.com/a/1190000009166436)
+* [关于map/reduce的参数配置1](https://www.cnblogs.com/wcwen1990/p/7601252.html)
+* [关于map/reduce的参数配置2](https://blog.csdn.net/zhong_han_jun/article/details/50814246)
+
+
+
+## 用户自定义函数
+
+* 查看用户自定义函数: show functions;
+* 查看某个函数: describe function concat;
+* 使用UDF函数
+	1. 将自定义函数打包成jar文件,上传到集群
+	2. 在hive中添加add jar /path/xxx.jar,注意jar路径不需要引号引起
+	3. 创建临时函数:create temporary function myfunc as '包名.主函数名'
+		* 注意,这里只是临时函数,仅仅作用于当前会话.
+	4. 如果频繁需要需要将jar文件添加到$HOME/.hiverc中.
+* 删除函数 drop temporary function;
+* 用户自定义函数分为UDF/UDAF/UDTF三种.
+
+## Streaming-TRANSFORM
+* hive是通过利用或扩展hadoop组件来运行的,通过抽象InputFormat,OutputFormat来定义数据的输入输出.Streaming提供了另一种处理数据的方式,在Streaming job中,会为外部进程开启一个I/O管道,然后数据会被传给这个进程,其会从标准输入中读取数据,然后通过标准输出来写数据结果,最后返回到Streaming API job中.
+* 在使用关键字TRANSFORM来使用Streaming功能.
+
+```sql
+SELECT TANSFORM(col1,col2)
+USING '/bin/cat' AS new_col1,new_col2
+FROM table
+
+
+--定义输出格式
+SELECT TANSFORM(col1,col2)
+USING '/bin/cat' AS (
+	new_col1 STRING,
+	new_col2 INT
+) ROW FORMAT DELIMITED
+LINES TERMINATED BY '\n' 
+...
+FROM table
+
+```
+
+* 在写UDTF的时候,一般transform 与 distribute + sort联合使用更有效果,因为distribute+sort能将固定数据分到同一个reduce中,然后做处理.
+
+## 示例,计算用户在线时长
+
+### 工作内容
+* 计算某个用户某台设备的在线时长
+
+### 内容解读
+* 数据中并没有统计累计在线时长的,所以需要自己计算.
+* 计算在线时长需要定义怎么才算在线?
+	* 如果在线肯定会有接口请求数据
+	* 在线的隐式含义是连续的接口请求,如何才算连续?
+		* 定义上下两次接口之间的间隔时间大小才认定是否有效连续.
+			* 间隔时间长,认为断开重连,不是本次在线间断->结束
+			* 间隔时间短,可认为在线,可认为是连续请求.我们这定义为300秒,也就是5分钟.
+	* 计算本次在线最开始接口请求的时间和最后接口请求的时间之差就是在线时长.
+* 缺点
+	* 有的中途切换并不能认证为同一次在线,导致中间间隔时间多加.
+	* 有的页面停留时间过长,导致认为两次在线,导致中间间隔时间没加.
+	* 总之跟定义连续接口访问的时间限制大小有很大关系.
+		* 因为我们现在app的ugc内容以图片为主,所以停留时间不长,5分钟已经扩的很开.
+		* 需要根据业务来指定
+
+### 思路
+1. hive本身没有类似UDF可以使用,所以需要自己定义函数来完成计算.
+2. 定义什么函数?计算在线时长是聚合操作,以用户分组.
+	* UDAF -- java
+	* transform -- python
+3. 根据同一用户,同一台设备分组.
+4. 计算在定义的有效时间内,前后次请求的差值.可以认为这个差值就是本次点击的在线时长
+5. 遇到超出有效时间的连续请求可认定为断开连接,本次在线结束.
+6. 结束时,汇总所有接口之间差值就是在线时长.
+
+### 代码
+* 因为我现在公司的技术栈没有java,则采用transform的方式来计算.
+* 下面是transform的具体用法sql部分
+* transform语法,hql部分
+
+```sql
+	add file transform1.py;
+	add file transform2.py;
+	-- 插入新表
+	from(
+	 	select ... from table where ...
+	) tmp
+	insert overwrite table1 partition(dt = '')
+	select transform(tmp.*) -- 使用transform,tmp.*是传入的数据
+	using 'python transform1.py' -- 执行transform的文件
+	as( -- transform输出结果
+		col1 int,
+		col2 string,
+		...
+	)
+	row format -- 定义transform输出格式
+	delimited fields terminated by '\001'
+	collection items terminated by '\002'
+	map keys terminated by '\003'
+	
+	insert overwrite table1 partition(dt = '')
+	select transform(tmp.*) -- 使用transform,tmp.*是传入的数据
+	using 'python transform2.py' -- 执行transform的文件
+	...
+
+
+	-- 数据转换	
+	select transform(t.*) -- 使用transform,tmp.*是传入的数据
+	using 'python transform.py' -- 执行transform的文件
+	as( -- transform输出结果
+		col1 int,
+		col2 string,
+		...
+	)
+	from(
+		select ... from table where ...
+	) t
+		
+```
+
+* user_time.hql
+
+``` sql
+
+-- user_time.hql
+ADD FILE transform.py; --添加transform脚本
+
+FROM
+    (
+        SELECT
+            device_id,
+            uid,
+            path,
+            request_timestamp
+        FROM ods.api_access_log acl
+        WHERE partition_date={{DATE}} --{{DATE}}是参数
+        DISTRIBUTE BY device_id --用设备ID分桶
+        SORT BY device_id, request_timestamp --排序
+) tmp --基表,用于收集要处理的数据
+INSERT OVERWRITE TABLE dw.dw_user_use_time --要插入的表partition(partition_date={{DATE}}) --要插入表的分区
+SELECT TRANSFORM(tmp.*) -- transform语法,传入tmp的所有数据
+USING 'python transform.py' -- transform.py 和 hql 在一个文件夹下
+AS( -- transform输出
+    device_id string,
+    user_id bigint,
+    use_time int
+)
+ROW FORMAT -- transform输出格式
+DELIMITED FIELDS TERMINATED BY '\001'
+COLLECTION ITEMS TERMINATED BY '\002'
+MAP KEYS TERMINATED BY '\003'
+
+```
+  
+* transform.py内容
+
+``` python
+
+import os
+import sys
+
+	for line in sys.stdin: 
+		# sys.stdin 是select transform(tmp.*)传输进来的
+		
+		line = line.rstrip('\n') # 去除行末尾的换行符
+		col1,col2,col3 = line.split()
+		
+	... # 处理过程
+	
+	# transform输出  必须要用print输出
+	# 如果是array,map结构的拼成字符串即可,在hql输出的时候用row format规定格式分割
+	print '\t'.join(map(str,[col1, col2, col3]))
+	
+
+```
+
+* 问题解决的transform.py
+
+```python 
+
+#!/usr/bin/python
+#encoding:utf-8
+# transform.py
+
+import sys
+import time
+
+define USER_LEAVE_INTERVAL = 300 # 定义有效时间
+
+def process(data):
+    total_cost_time = 0 # 总的使用时间
+    prev_request_time = None # 上一个请求时间
+    user_id = None # 记录当前处理的用户ID
+    device_id = None # 记录当前处理的设备ID
+    
+    for parts in data:
+        try:
+            device_id, uid, path, request_time = parts
+            request_time = long(request_time)
+            
+            if prev_request_time is None: # 初始化
+                prev_request_time = request_time 
+                user_id = uid 
+                device_id = device_id
+                continue
+           
+            cost = request_time - prev_request_time # 计算前后两个请求时间差值
+            prev_request_time = request_time # 更新上一个请求时间为当前时间
+            if cost > 0 and cost < USER_LEAVE_INTERVAL: # 差值时间有效
+                total_cost_time += cost # 加入总的时间
+        except:
+            continue
+    if total_cost_time > 0: # 输出
+        print "\001".join(map(str, [device_id, uid, total_cost_time]))
+        
+def main():
+
+    old_device_id = None # 用于标识上一条数据的设备ID
+    buffers = [] # 用户保存要传入处理过程的列表
+    for line in sys.stdin: # 获取transform的输出
+        line = line.rstrip('\n') 
+        if not line: # 空行略过
+            continue
+        parts = line.split() # 切分数据
+        if len(parts) != 4: # 如果传入的数据为脏数据,略过
+            continue
+        device_id = parts[0] # 获取设备ID
+
+        if device_id == "": # 设备ID为空,略过
+            continue
+
+        if device_id != old_device_id: # 如果当前设备ID 不等于 上一条数据的设备ID
+            if old_device_id: # 且上一条数据设备ID不为None,说明上个设备数据取完(tmp.*传入的数据是按照设备ID排序的)
+                process(buffers) # 对这个设备ID的数据进行处理
+            old_device_id = device_id # 更新设备ID为当前设备ID
+            buffers = [] # 置空
+
+        buffers.append(parts) # 设备ID相同时直接加入buffer
+    else:
+        if buffers:
+            process(buffers)
+
+if __name__ == "__main__":
+    main()
+
+```
+
