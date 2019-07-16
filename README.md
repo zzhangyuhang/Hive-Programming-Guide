@@ -513,7 +513,7 @@ SORT BY s.symbol desc, s.price asc;
 ### 类型转化
 
 * 显示转换:cast(col as type)
-* 饮食转换
+* [隐式转换](https://www.iteblog.com/archives/892.html)
 
 ### 数据抽样
 * tablesample
