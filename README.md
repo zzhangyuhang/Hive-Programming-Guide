@@ -456,6 +456,10 @@ group by a;
 	* x|y表示和x或者y匹配
 	* 例如:RLIKE '.\*(Chicago|Ontario).\*'表示为中间包含Chicago或Ontario的字符串.
 
+### with as
+* [with as用法1](https://blog.csdn.net/Abysscarry/article/details/81322669)
+* [with as用法2](https://blog.csdn.net/high2011/article/details/85335954)
+
 ### 连接
 * hive不支持不等值连接,只支持等值连接.
 * 对于多表连接,大多数情况下,hive会对没对JOIN连接对象启动一个MR任务.从左到右,首先启动一个完成第一个表和第二表的连接操作,然后再启动一个MR任务完成上个输出和第三个表的连接操作.
@@ -541,8 +545,9 @@ LIMIT 10;
 
 ```
 
-### 窗口函数和cube
+### 窗口函数
 
+* [窗口函数](http://lxw1234.com/search/窗口函数)
 * [窗口函数和cube](https://www.jianshu.com/p/9fda829b1ef1?from=timeline)
 
 
@@ -949,3 +954,26 @@ if __name__ == "__main__":
 
 ```
 
+### 使用窗口函数解决用户在线时长问题
+* 窗口函数lag和lead是取当前函数的前/后n条数据
+* [使用详解](http://lxw1234.com/archives/2015/04/190.htm)
+
+* 思路:我们可以通过lag窗口函数将当前访问记录和上个访问记录进行连接.然后计算前后两条访问时间的间隔.然后对间隔进行累加就是最终的在线时长.
+
+```sql
+
+select device_id,uid,path,sum(last_request_timestamp - request_timestamp) as use_time
+from 
+(
+	SELECT
+	   device_id,
+	   uid,
+	   path,
+	   request_timestamp,
+	   lag(request_timestamp,1, 0) over(partition by device_id,uid,path order by request_timestamp) as last_request_timestamp
+	FROM ods.api_access_log acl
+	WHERE partition_date={{DATE}} --{{DATE}}是参数
+) t 
+where last_request_timestamp - request_timestamp <= 300 
+
+```
