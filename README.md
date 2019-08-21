@@ -549,6 +549,15 @@ LIMIT 10;
 
 * [窗口函数](http://lxw1234.com/search/窗口函数)
 * [窗口函数和cube](https://www.jianshu.com/p/9fda829b1ef1?from=timeline)
+* hive是不支持count(distinct) over()的窗口函数的.但是我们可以使用size(collect_set() over())来代替完成
+
+``` sql
+select date, uid
+	    count(distinct uid) over(partition by date),--不要这样写,不支持
+	    size(collect_set(uid) over(partition by date)) --支持.
+from table
+```
+
 
 
 ## 视图
@@ -711,6 +720,38 @@ SELECT url, ip, user_id FROM s WHERE dt='20190101'
 * [关于数据倾斜问题的解决](https://segmentfault.com/a/1190000009166436)
 * [关于map/reduce的参数配置1](https://www.cnblogs.com/wcwen1990/p/7601252.html)
 * [关于map/reduce的参数配置2](https://blog.csdn.net/zhong_han_jun/article/details/50814246)
+
+
+### 数据倾斜
+
+#### join数据倾斜
+1. 异常值null跟任何值关联都失败,hive会起一个reduce专门处理关联失败的数据,可能导致改reudce处理的数据大.
+	* 解决方式
+		* 如果业务需要null值,将null值随机赋值打散nvl(col,rand())或者分开处理
+		* 不需要null直接过滤掉
+2. 关联键类型不统一导致关联失败.一个关联键为int类型,另一个关联键为string.可能导致类型隐式转换不一样关联不上的情况.
+	* 解决方式:cast将类型统一,最好少依赖类型隐式转换.
+
+#### group by数据倾斜
+* 在group by的时候数据分布不均匀,导致某个reduce处理的数据量远大于别的reduce.
+* 解决方式
+	0. 尽量减少关联表的数据量.
+	1. 开启均衡负载参数:set hive.groupby.skewindata=true.当选项设定为 true，生成的查询计划会有两个 MR Job。第一个 MR Job 中，Map 的输出结果集合会随机分布到 Reduce 中，每个 Reduce 做部分聚合操作，并输出结果，这样处理的结果是相同的 Group By Key 有可能被分发到不同的 Reduce 中，从而达到负载均衡的目的；第二个 MR Job 再根据预处理的数据结果按照 Group By Key 分布到 Reduce 中（这个过程可以保证相同的 Group By Key 被分布到同一个 Reduce 中），最后完成最终的聚合操作。
+	2. 开启combiner:set hive.map.aggr=true
+	3. 大表join小表:转化为mapjoin.
+	4. 大表join大表:找到大key需要将其分配的数据散.
+		* 如果大key是静态的且可少量,直接单独处理即可然后与其他数据union all
+		* 如果大key是动态的且量比较大,需要维护一个大key的临时表.将大key和普通key分开处理.最好能转化成mapjoin.
+
+[大表join大表数据倾斜优化](https://www.cnblogs.com/shaosks/p/9491905.html)
+
+[hive数据倾斜方法总结](https://www.cnblogs.com/kongcong/p/7777092.html)
+
+#### HQL数据倾斜
+* HQL尽量将数据控制到最小.在连接前加上分区剪裁和分桶剪裁.
+* count(distinct)在hive中屏蔽用户设置的reducer个数且只使用一个reducer,所以在处理大量数据的时候会异常缓慢.尽量改写成为sum() from(group by())
+
+[count(distinct)原理](https://blog.csdn.net/oracle8090/article/details/80760233)
 
 
 
