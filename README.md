@@ -1020,3 +1020,111 @@ where last_request_timestamp - request_timestamp <= 300
 ```
 
 [关于页面统计学习博客](https://blog.csdn.net/zhaolq1024/article/details/81081710)
+
+
+### 连续登陆天数
+
+```sql
+	 --uid,flag,连续端起始时间,连续端结束时间,连续天数,连续段内所有天
+    select uid,flag, min(date) start_date, max(date) end_date, count(1) days, collect_set(date) as content
+    from
+    (
+        select uid, date, (date - row_number() over(partition by uid order by date)) flag
+        from 
+        (
+            select distinct uid,from_unixtime(add_time,'yyyyMMdd') as date
+            from nice_live_kkgoo.user_show_sid
+            where from_unixtime(add_time,'yyyyMMdd') between 20190601 and 20190630
+        ) t 
+    ) t 
+    group by 1,2
+```
+
+### 同时在线人数
+
+* 我们有这样的一张使用时间的表
+
+```sql
+create table user_use_time(
+   id int comment "使用记录ID",
+	uid int comment "用户id",
+	start_time string comment "用户使用开始时间",
+	end_time string comment "用户使用结束时间"
+)
+...
+
+
+user_id	login_time	logout_time	
+11111	12:00	12:02
+11112   12:01	12:03
+11113   12:00	12:08
+11114   12:00	12:03
+11115   12:03	12:04
+11116   11:00   13:00
+
+```
+
+* 开始时间和结束时间是一个明确的时间,并且只记录了这个使用记录的开始时间和结束时间,中间经历的时间没有记录.求:当天每分钟的最大同时在线人数.
+
+
+```sql
+with user_use_time as 
+(
+    select '11111' as user_id,	'12:00' as start_time,	'12:02' as end_time
+    union all
+    select '11112' as user_id,	'12:01' as start_time,	'12:03' as end_time
+    union all
+    select '11113' as user_id,  '12:00' as start_time,	'12:08' as end_time
+    union all
+    select '11114' as user_id,  '12:00' as start_time,	'12:03' as end_time
+    union all
+    select '11115' as user_id,  '12:03' as start_time,	'12:04' as end_time
+    union all
+    select '11116' as user_id,  '11:00' as start_time,	'13:00' as end_time
+) --模拟数据
+
+select num, --在线人数
+       time,--开始时间
+       lead(time, 1) over(order by time)--结束时间
+from 
+(
+    select distinct time, num --因为使用窗口函数计算的,需要去重
+    from(
+        select time,--开始时间
+               sum(num) over(order by time) as num --同时在线人数
+        from 
+        (
+        	  --每个开始时间,是人数增加.+1
+            select user_id, 
+            	      start_time as time, 
+            	      1 as num
+            from user_use_time
+            
+            union all
+            
+            --每个结束时间,是人数减少.-1
+            select user_id, 
+                   end_time as time, 
+                   -1 as num
+            from user_use_time
+        ) t
+    ) t 
+) t 
+```
+
+* 结果展示
+
+```
+在线人数/开始时间/结束时间
+1	11:00	12:00
+4	12:00	12:01
+5	12:01	12:02
+4	12:02	12:03
+3	12:03	12:04
+2	12:04	12:08
+1	12:08	13:00
+0	13:00	NULL
+
+```
+
+* 注意:这个结束时间是用lead窗口函数匹配出来的,而开始时间则是每个用户的使用开始时间和结束时间出现的记录.我们可以理解为当一个用户有了开始使用或者结束使用这个动作,那么在线人数会因为他的动作改变,每个改变就会产生一条记录,每条记录都有改变的时间阶段:开始时间是改变的时间(登录/退出的时间),结束时间是下一个改变的时间.
