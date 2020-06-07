@@ -188,13 +188,35 @@ LOCATION '/path1/path2/path3';
 
 ### 修改表
 * 表重命名: ALTER TABLE old_name RENAME TO new_name;
+* 修改表备注：ALTER TABLE table_name SET TBLPROPERTIES('comment' = new_comment);
+* 修改表/分区的存储格式：ALTER TABLE table_name [PARTITION partitionSpec] SET FILEFORMAT file_format
+* 修改表或分区的保护
+
+```sql
+--启用NO_DROP将保护表或者分区被删除，如果表中的任何分区启用了NO_DROP，该表也不能被删除
+ALTER TABLE table_name [PARTITION partition_spec] ENABLE|DISABLE NO_DROP;
+--启用OFFLINE将阻止表或者分区中的数据被查询，但元数据依然可以被访问。
+ALTER TABLE table_name [PARTITION partition_spec] ENABLE|DISABLE OFFLINE;
+```
+
+* 修改表存储属性
+
+```sql
+ALTER TABLE table_name CLUSTEREDBY (col_name, col_name, ...) [SORTED BY (col_name, ...)] INTO num_buckets BUCKETS
+--该语句改变表的物理存储属性。需要注意的时，上述修改表的语句仅修改表的Hive的元数据，不会重新组织或者重新格式化现存数据，用户需要确定实际的数据布局符合元数据的定义。
+```
+
 * 分区修改
-	* 添加分区: ALTER TABLE t ADD PARTITION(year=2012) 
-	* 删除分区: ALTER TABLE t DROP PARTITION(year=2012)
+	* 添加分区: ALTER TABLE t ADD [IF NOT EXISTS] PARTITION(year=2012) 
+	* 删除分区: ALTER TABLE t DROP [IF EXISTS] PARTITION(year=2012)
+	* 重命名分区: ALTER TABLE table_name PARTITION partition_spec RENAME TO PARTITION partition_spec
+	* 交换分区：ALTER TABLEtable_name_1 EXCHANGE PARTITION (partition_spec) WITH TABLE table_name_2;（将一个分区中的数据移动另一个拥有相同schema但没有那个分区的表中）
+	* 
 * 修改列信息
 	* 添加列: ALTER TABLE t ADD COLUMNS(id INT, name STRING);
 	* 替换列: ALTER TABLE t REPLACE COLUMNS(new_id INT);
-	* 修改列: ALTER TABLE t CHANGE COLUMN old_col new_col_name new col_type
+	* 修改列: ALTER TABLE t CHANGE COLUMN old_col new_col_name new col_type [FIRST|(AFTER column_name)]
+	* 删除列的操作仅修改元数据，并不删除数据
 
 > 注意
 > 
@@ -206,6 +228,7 @@ LOCATION '/path1/path2/path3';
 * 修改存储属性: ALTER TABLE t PARTITION(year=2012) SET FILEFORMAT SEQUENCEFILE
 * 修改分桶: ALTER TABLE t CLUSTERED BY(id) INTO 46 BUCKETS SORT BY(id)
 
+[修改表、分区、列](https://blog.csdn.net/duyuanhai/article/details/51603559)
 
 ### 外部表EXTERNAL TABLE
 * 创建外部表
@@ -1189,3 +1212,129 @@ create temporary macro ne2rand(x string)	case		when is_ne(x) then concat('hive
 --计算月的最后一天
 --create temporary macro last_day(dt string) last_day(dt);--create temporary macro last_day_last_month(dt string) last_day(add_months(dt, -1));
 ```
+
+## 锁机制
+* 设计目的：Hive 锁机制是为了让 Hive 支持并发读写而设计的。注意，脏读的问题本身通过实现了原子的 reader/writer 已经得到解决（https://issues.apache.org/jira/browse/HIVE-829）和锁机制并不绑定
+* Hive有两种锁
+	* 共享锁 Shared (S)
+		* 共享锁是可以多重、并发使用的，查询使用的是共享锁
+	* 互斥锁/独享锁/排他锁 Exclusive (X)
+		* 独占锁会阻止其他的查询、修改操作，修改表操作使用独占锁
+* 使用场景：
+	* 元信息和数据的变更需要互斥锁
+	* 数据的读取需要共享锁
+* 如何开启和关闭锁机制
+	* hive 在 0.7 版本之后开始支持并发，线上的环境默认是用 zookeeper 做 hive 的锁管理，Hive开启并发功能的时候自动开启锁功能。
+
+```sql
+set hive.support.concurrency=true; --开启并发，开启锁
+set hive.support.concurrency=false; --关闭并发，关闭锁
+
+set hive.exec.parallel=true； --Job并发执行，默认不开启
+set hive.exec.parallel.thread.number=最大并发job数;
+注意：两者之间的区别
+```
+
+* 锁的应用最小单位为分区。Hive 的一些场景操作对应的锁级别如下：
+
+| Hive Command                                            | Locks Acquired                           |
+| ------------------------------------------------------- | ---------------------------------------- |
+| elect .. T1 partition P1                                | S on T1, T1.P1                           |
+| insert into T2(partition P2) select .. T1 partition P1  | S on T2, T1, T1.P1 and X on T2.P2        |
+| insert into T2(partition P.Q) select .. T1 partition P1 | S on T2, T2.P, T1, T1.P1 and X on T2.P.Q |
+| alter table T1 rename T2                                | X on T1                                  |
+| alter table T1 add cols                                 | X on T1                                  |
+| alter table T1 replace cols                             | X on T1                                  |
+| alter table T1 change cols                              | X on T1                                  |
+| alter table T1 add partition P1                         | S on T1, X on T1.P1                      |
+| alter table T1 drop partition P1                        | S on T1, X on T1.P1                      |
+| alter table T1 touch partition P1                       | S on T1, X on T1.P1                      |
+| *alter table T1 set serdeproperties *                   | S on T1                                  |
+| *alter table T1 set serializer *                        | S on T1                                  |
+| *alter table T1 set file format *                       | S on T1                                  |
+| *alter table T1 set tblproperties *                     | X on T1                                  |
+| drop table T1                                           | X on T1                                  |
+
+* 补充
+	* load data (local) inpath ' ' into table xx partition() 触发的锁操作同insert
+	* 直接在hadoop上 hadoop dfs -put xx yy 不触发锁。（可以用在shell上 执行 hadoop dfs -put file hdfsmulu 这两天命令来代替 load data，避免锁）
+	* load data 时若分区不存在会创建分区，而hadoop dfs -put不会, 需先调用alter table add partition来创建分区。 若一个操作正在读取表中数据，这时向表的分区中put数据，该数据在本次读时不会被加载，下次读操作时才会被加载。
+
+### 锁的相关操作
+* 查看某个表或者分区的锁。show locks table_name
+
+```sql
+SHOW LOCKS <TABLE_NAME> ;
+SHOW LOCKS  <TABLE_NAME> EXTENDED;
+SHOW LOCKS  <TABLE_NAME> PARTITION ();
+SHOW LOCKS  <TABLE_NAME> PARTITION () EXTENDED;
+```
+
+* 加锁(注意：一般加锁操作指的是加互斥锁)。lock table table_name
+	* 表被独占锁之后，将不能执行查询操作
+
+```sql
+lock table t1 exclusive;
+```
+
+* 解锁。unlock table table_name
+
+```sql
+unlock table your_table;
+unlock table your_table partition(dt=‘2014-04-01’);
+```
+
+* 关闭锁
+	* hive的锁在某些情况下会影响job的效率。在对数据一致性要求不高，或者已经明确了解到lock不会对job产生影响的情况下可以在session级别关闭lock的支持。
+	* 可以通过 set hive.support.concurrency=false 参数在 session 中关闭锁
+	* 关闭锁机制会造成下面影响
+		* 并发读写同一份数据时，读操作可能会随机失败
+		* 并发写操作的结果在随机出现，后完成的任务覆盖之前完成任务的结果
+		* SHOW LOCKS， UNLOCK TABLE 会报错
+
+* 在锁冲突的时候，锁的几个配置
+	* hive.lock.numretries #重试次数
+	* hive.lock.sleep.between.retries #重试时sleep的时间，默认的sleep时间是60s，比较长，在高并发场景下，可以减少这个的数值来提供job的效率
+
+* hive 处理表的流程
+
+```
+1.首先对query进行编译，生成QueryPlan
+
+2.构建读写锁对象（主要两个成员变量：LockObject，Lockmode）
+对于非分区表，直接根据需要构建S或者X锁对象
+对于分区表：(此处是区分input/output)
+If S mode:
+	直接对Table/related partition 构建S对象
+Else：
+	If 添加新分区：
+		构建S对象
+	Else
+		构建X对象
+End
+
+3.对锁对象进行字符表排序(避免死锁)，对于同一个LockObject，先获取Execlusive
+
+4.遍历锁对象列表，进行锁申请
+While trynumber< hive.lock.numretries(default100):
+	创建parent（node）目录,mode= CreateMode.PERSISTENT
+	创建锁目录，mode=CreateMode.EPHEMERAL_SEQUENTIAL
+For Child：Children
+	If Child已经有写锁：
+		获取child写锁seqno
+	If mode=X 并且 Child 已经有读锁
+		获取child读锁seqno
+	If childseqno>0并且小于当前seqno
+		释放锁
+	Trynumber++
+	Sleep(hive.lock.sleep.between.retries:default1min)
+```
+
+* 注意事项
+	* 表建议设置分区，锁的粒度可以到分区，否则容易遭遇长时间锁表，尤其大字典表、单张全量表要注意。
+	* 建议脚本重跑一段时间范围数据时设置 sleep 间隔，避免长期持有锁，造成依赖表的任务调度失败。
+	* 我们可以通过 set hive.support.concurrency=false 来关闭锁，优先保证插入数据成功，虽然此时读数据会有问题。
+
+### 锁相关只是涉及到ddl和select，并不涉及到update和delete。Hive中只有开启事物才可以进行update和delete。
+
+[Hive 事务和锁的实践](https://www.infoq.cn/article/guide-of-hive-transaction-management/)
