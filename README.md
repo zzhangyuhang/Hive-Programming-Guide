@@ -1338,3 +1338,113 @@ For Child：Children
 ### 锁相关只是涉及到ddl和select，并不涉及到update和delete。Hive中只有开启事物才可以进行update和delete。
 
 [Hive 事务和锁的实践](https://www.infoq.cn/article/guide-of-hive-transaction-management/)
+
+### 记一次Map Join优化
+#### 背景
+ * 观众、作者粒度的内容消费（曝光+消费）表
+ *  关联维作者和观众的维度信息。
+
+#### 初始方案：
+*  观众、作者粒度的内容消费（曝光+消费）表，可从底层的构建的消费数据和曝光数据按照观众、作者粒度进行聚合，因为粒度比较细，基本不太可能产生数据倾斜问题，唯一可能就是观众id为null或者0这些默认值时，如果业务不关注这类数据，可以直接拿掉。如果关注的话，这类问题属于group by倾斜，可以打散处理，或者采用groupby.skewindata参数。
+
+> hive.groupby.skewindata=true;
+> 如果group by过程出现倾斜应该设置为true
+> set hive.groupby.mapaggr.checkinterval=100000;
+> 这个是group的键对应的记录条数超过这个值则会进行优化,也是一个job变为两个job
+
+* 构建好观众、作者粒度的内容消费表后，用该表关联观众和作者的维度信息。
+
+#### 问题产生
+* 在关联作者的维度信息时，产生数据倾斜，属于JOIN数据倾斜。
+* 原因是：基础的消费数据表是观众+作者粒度，观众和作者的两个对象的关系都是彼此一对多的关系。一个观众可以消费多个作者的作品，一个作者的作品可以被多个观众消费。关联观众的维表时一般不会产生数据倾斜，因为一个观众能消费的作者数一般都不会很大，所以在该粒度下的大key的条数也不会很多。但是对于一个作者的作品，可能会被上千万的用户消费，也可能基本没有被消费。根据该作者的作品质量和人气影响，很容易出现热点数据造成数据倾斜。热点数据的名单是动态的。
+
+#### 解决方法
+1. 调节JOIN大key的拆散参数：
+	* set hive.optimize.skewjoin = true;
+	* set hive.skewjoin.key = 1000000;
+	* 这个参数是玄学参数，可能没有用
+2. 增大reduce个数，减少热点数据被分到一个reduce的概率：
+	* hive.exec.reducers.bytes.per.reducer（每个reduce任务处理的数据量，默认为1000^3=1G）
+	* hive.exec.reducers.max（每个任务最大的reduce数，默认为999）
+	* reduce num = Min(参数2, total/参数1)
+	* 本次调优将reduce处理的数据量减半，且增大了max_reduce数
+3. 注意在配置参数的时候，如果没有特殊情况不要将cbo关闭，在这里cbo可能会减少大key的hash碰撞问题。
+	* hive.cbo.enable=true;
+4. 将热点数据拆出，做Map Join。因为本次倾斜的发生地主要是在reduce端，任何到reduce端的操作（distribute by）都不会太快。考虑过做桶表，因为桶表可以加快Join，但是涉及到维表不是桶表以及分桶策略（将大key打散），不可行。
+
+#### Map-Join修改过程
+
+1. 正常聚合观众-作者粒度的消费数据表
+2. 构建一张临时表：以倾斜键为粒度上卷count(1)，找出热点数据都有哪些，提取出TOP的名单。注意：这个名单如果是动态变化的，需要每天都筛选一遍。如果考虑复用性问题，可以组合多种策略筛选出热点数据的名单。本次就针对这个任务，直接采用作者粒度，count(1)取TOP-xxxx的数据。一般这个top多少，需要根据你的数据分布来定，不同的top效果也不一定，需要进行测试。
+3. 用热点数据名单做Map-Join，先筛选出该名单的消费数据，然后筛选出该名单的维度信息。然后做Left Join关联，关联不上的键就是非热点数据。
+4. 对于非名单的非热点作者，也可以通过Map-Left Join做热点数据的关联，然后筛选出id is null的数据极为非热点数据。
+5. 将两部分数据 union all
+
+```sql
+--观众-作者粒度内容消费数据聚合表consume略
+--提取热点数据
+create table if not exists hot_spot(
+    	id bigint comment '热点数据id'
+    	,cnt bigint comment '热点数据id'
+)comment ‘热点数据名单’
+partitioned by(
+	p_date 	string comment '日期'
+)
+story as parquet;
+insert overwrie table hot_spot partiton(p_date = xxx)
+select
+	id,
+	count(1) cnt
+group by id
+order by cnt desc 
+limit xxxx;
+
+--热点数据单独处理
+select * 
+from 
+(	--map-join筛选出热点的消费数据
+	select /*+mapjoin(hot_spot)*/
+		id,*
+	from consume a
+	join hot_spot b 
+	on a.id = b.id and b.p_date = 'xxxx'
+	where a.p_date = 'xxxx'
+) t
+left join(
+	--map-join筛选出热点的作者维度信息
+	select /*+mapjoin(hot_spot)*/
+		id,*
+	from info a
+	join hot_spot b 
+	on a.id = b.id and b.p_date = 'xxxx'
+	where a.p_date = 'xxxx'
+) s
+on t.id = s.id
+
+union all
+
+--非热点数据:可以走map-left join来筛选非热点数据
+select * 
+from 
+(	--map-join筛选出热点的消费数据
+	select /*+mapjoin(hot_spot)*/
+		id,*
+	from consume a
+	left join hot_spot b 
+	on a.id = b.id and b.p_date = 'xxxx'
+	where a.p_date = 'xxxx'
+	and b.id is null
+) t
+left join(
+	--map-join筛选出热点的作者维度信息
+	select /*+mapjoin(hot_spot)*/
+		id,*
+	from info a
+	left join hot_spot b 
+	on a.id = b.id and b.p_date = 'xxxx'
+	where a.p_date = 'xxxx'
+	and a.id is null
+) s
+on t.id = s.id
+
+```
